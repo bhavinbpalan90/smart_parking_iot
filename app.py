@@ -8,6 +8,9 @@ import os
 import math
 import base64
 import logging
+import threading
+import subprocess
+import json
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization
@@ -268,8 +271,6 @@ def populate_parking_facilities():
 
 def create_profile_json():
     """Create profile.json for snowpipe-streaming SDK authentication."""
-    import json
-    
     if not PRIVATE_KEY_PATH or not os.path.exists(PRIVATE_KEY_PATH):
         logger.error(f"Private key file not found: {PRIVATE_KEY_PATH}")
         return None
@@ -564,7 +565,7 @@ def _generate_plate_for_state(state: str) -> str:
         return f"{random.choices(letters, k=2)[0]}{random.choices(letters, k=1)[0]}-{random.randint(1000, 9999)}"
     
     elif state == "DE":
-        # Delaware: 123456 (numeric only, up to 6 digits)
+        # Delaware: 123456
         return f"{random.randint(10000, 999999)}"
     
     elif state == "RI":
@@ -572,136 +573,29 @@ def _generate_plate_for_state(state: str) -> str:
         return f"{random.randint(100, 999)}-{random.randint(100, 999)}"
     
     else:
-        # Generic format: ABC-1234
+        # Generic format for other states
         return f"{random.choices(letters, k=3)[0]}{random.choices(letters, k=1)[0]}{random.choices(letters, k=1)[0]}-{random.randint(1000, 9999)}"
 
-def get_traffic_pattern_tag(facility_id, event_type):
-    """Generate a descriptive tag for the traffic pattern being simulated."""
-    current_hour = datetime.now().hour
-    district = get_district_for_facility(facility_id)
-    pattern = DISTRICT_PATTERNS.get(district, {})
-    weekend = is_weekend()
-    
-    day_type = "weekend" if weekend else "weekday"
-    day_mult = pattern.get("weekend_mult", 1.0) if weekend else pattern.get("weekday_mult", 1.0)
-    
-    peak_entry_hours = pattern.get("peak_entry_hours", [])
-    peak_exit_hours = pattern.get("peak_exit_hours", [])
-    
-    is_peak_entry = current_hour in peak_entry_hours
-    is_peak_exit = current_hour in peak_exit_hours
-    
-    tags = []
-    
-    if day_mult > 1.0:
-        tags.append(f"{day_type}_busy")
-    elif day_mult < 0.5:
-        tags.append(f"{day_type}_quiet")
-    else:
-        tags.append(day_type)
-    
-    if event_type == "CAR_IN" and is_peak_entry:
-        tags.append("peak_entry_hour")
-    elif event_type == "CAR_OUT" and is_peak_exit:
-        tags.append("peak_exit_hour")
-    elif current_hour >= 23 or current_hour < 5:
-        tags.append("night_hours")
-    elif 6 <= current_hour <= 9:
-        tags.append("morning")
-    elif 17 <= current_hour <= 19:
-        tags.append("evening_rush")
-    else:
-        tags.append("midday")
-    
-    return f"{district}|{'+'.join(tags)}|mult:{day_mult:.1f}x"
-
-def get_entry_bias(facility_id):
-    """Get entry bias based on time of day and district."""
-    current_hour = datetime.now().hour
-    district = get_district_for_facility(facility_id)
-    pattern = DISTRICT_PATTERNS.get(district, {})
-    
-    if current_hour in pattern.get("peak_entry_hours", []):
-        return pattern.get("entry_boost", 1.5)
-    
-    if current_hour >= 23 or current_hour < 5:
-        if district == "Entertainment":
-            return 0.5
-        return 0.1
-    
-    return 1.0
-
-def get_exit_probability(parked_hours, district, current_hour):
-    """
-    Calculate probability that a car will exit based on:
-    - How long it's been parked (longer = higher probability)
-    - District type (malls = shorter stays, airports = longer)
-    - Time of day (peak exit hours = higher probability)
-    
-    Returns probability between 0 and 1.
-    """
-    pattern = DISTRICT_PATTERNS.get(district, {})
-    avg_stay = pattern.get("avg_stay_hours", 4)
-    peak_exit_hours = pattern.get("peak_exit_hours", [])
-    exit_boost = pattern.get("exit_boost", 1.5)
-    
-    # Base probability increases with duration relative to average stay
-    # At avg_stay hours, probability is ~15%
-    # At 2x avg_stay, probability is ~40%
-    # At 3x avg_stay, probability is ~70%
-    duration_ratio = parked_hours / avg_stay
-    
-    if duration_ratio < 0.5:
-        base_prob = 0.02  # Very unlikely to leave early
-    elif duration_ratio < 1.0:
-        base_prob = 0.05 + (duration_ratio - 0.5) * 0.2  # 5-15%
-    elif duration_ratio < 2.0:
-        base_prob = 0.15 + (duration_ratio - 1.0) * 0.25  # 15-40%
-    elif duration_ratio < 3.0:
-        base_prob = 0.40 + (duration_ratio - 2.0) * 0.30  # 40-70%
-    else:
-        base_prob = 0.70 + min(0.25, (duration_ratio - 3.0) * 0.1)  # 70-95%
-    
-    # Boost probability during peak exit hours
-    if current_hour in peak_exit_hours:
-        base_prob *= exit_boost
-    
-    # Cap at 95%
-    return min(0.95, base_prob)
-
-def get_traffic_multiplier(facility_id):
-    """Get overall traffic multiplier for a facility."""
-    current_hour = datetime.now().hour
-    config = get_facility_config(facility_id)
-    district = get_district_for_facility(facility_id)
-    
-    base = config.get("base_rate", 0.5)
-    
-    if current_hour in config.get("peak_hours", []):
-        base = min(1.0, base * 1.5)
-    
-    day_mult = get_day_of_week_multiplier(district)
-    
-    return min(1.0, base * day_mult)
-
-# ============== In-Memory State Management ==============
+# ============== Real-Time Event Generation ==============
 
 def initialize_facilities_state():
-    """Initialize in-memory state for all facilities."""
+    """Initialize in-memory facility state."""
     facilities = {}
     for config in FACILITY_CONFIGS:
-        district = get_district_for_facility(config["id"])
         facilities[config["id"]] = {
+            "id": config["id"],
             "name": config["name"],
+            "district": get_district_for_facility(config["id"]),
             "total_spots": config["spots"],
-            "available": config["spots"],
+            "available": config["spots"],  # Start with all spots available
             "rate": config["rate"],
-            "district": district,
+            "base_rate": config.get("base_rate", 0.5),
+            "peak_hours": config.get("peak_hours", []),
         }
     return facilities
 
 def reset_state():
-    """Reset all in-memory state."""
+    """Reset all session state."""
     st.session_state.facilities = initialize_facilities_state()
     st.session_state.active_sessions = {}
     st.session_state.recent_events = []
@@ -711,23 +605,99 @@ def reset_state():
     st.session_state.last_event_count = 0
     st.session_state.last_count_time = time.time()
 
-# ============== Event Generation ==============
+def get_traffic_multiplier(facility_id):
+    """Get traffic multiplier based on district, day of week, and hour."""
+    config = get_facility_config(facility_id)
+    district = get_district_for_facility(facility_id)
+    pattern = DISTRICT_PATTERNS.get(district, {})
+    
+    base_mult = get_day_of_week_multiplier(district)
+    
+    current_hour = datetime.now().hour
+    peak_hours = config.get("peak_hours", [])
+    
+    if current_hour in peak_hours:
+        base_mult *= pattern.get("entry_boost", 1.5)
+    
+    return base_mult
+
+def get_traffic_pattern_tag(facility_id, event_type):
+    """Generate traffic pattern tag for the event."""
+    district = get_district_for_facility(facility_id)
+    pattern = DISTRICT_PATTERNS.get(district, {})
+    weekend = is_weekend()
+    current_hour = datetime.now().hour
+    
+    day_type = "weekend" if weekend else "weekday"
+    day_mult = pattern.get("weekend_mult", 1.0) if weekend else pattern.get("weekday_mult", 1.0)
+    
+    peak_entry = current_hour in pattern.get("peak_entry_hours", [])
+    peak_exit = current_hour in pattern.get("peak_exit_hours", [])
+    
+    tags = []
+    if day_mult > 1.0:
+        tags.append(f"{day_type}_busy")
+    elif day_mult < 0.5:
+        tags.append(f"{day_type}_slow")
+    else:
+        tags.append(f"{day_type}_normal")
+    
+    if event_type == "CAR_IN" and peak_entry:
+        tags.append("peak_entry_hour")
+    elif event_type == "CAR_OUT" and peak_exit:
+        tags.append("peak_exit_hour")
+    
+    return f"{district}|{'+'.join(tags)}|mult:{day_mult:.1f}x"
+
+def get_exit_probability(parked_hours, district, current_hour):
+    """Calculate probability of a car exiting based on duration and context."""
+    # Minimum stay is 15 minutes
+    if parked_hours < 0.25:
+        return 0.0
+    
+    pattern = DISTRICT_PATTERNS.get(district, {})
+    avg_stay = pattern.get("avg_stay_hours", 4)
+    
+    # Base probability increases with time parked
+    if parked_hours < 0.5:
+        base_prob = 0.05
+    elif parked_hours < 1:
+        base_prob = 0.1
+    elif parked_hours < avg_stay * 0.5:
+        base_prob = 0.15
+    elif parked_hours < avg_stay:
+        base_prob = 0.25
+    elif parked_hours < avg_stay * 1.5:
+        base_prob = 0.4
+    elif parked_hours < avg_stay * 2:
+        base_prob = 0.6
+    else:
+        base_prob = 0.8  # Very likely to leave after 2x average stay
+    
+    # Boost during peak exit hours
+    if current_hour in pattern.get("peak_exit_hours", []):
+        base_prob *= pattern.get("exit_boost", 1.5)
+    
+    return min(0.95, base_prob)
 
 def process_car_entry(facility_id):
-    """Process a single car entry - no planned exit time."""
-    facility = st.session_state.facilities.get(facility_id)
-    if not facility or facility["available"] <= 0:
+    """Process a single car entry event."""
+    facility = st.session_state.facilities[facility_id]
+    
+    if facility["available"] <= 0:
         return None
     
-    session_id = str(uuid.uuid4())
+    # Generate license plate with state
     license_plate, license_plate_state = generate_license_plate()
+    session_id = str(uuid.uuid4())
     event_time = datetime.now()
     
     # Update facility state
     facility["available"] -= 1
     
-    # Store active session (no planned exit - just entry time)
-    st.session_state.active_sessions[session_id] = {
+    # Create session
+    session = {
+        "session_id": session_id,
         "license_plate": license_plate,
         "license_plate_state": license_plate_state,
         "facility_id": facility_id,
@@ -736,19 +706,19 @@ def process_car_entry(facility_id):
         "in_time": event_time,
         "rate": facility["rate"],
     }
+    st.session_state.active_sessions[session_id] = session
     
     # Create event
     traffic_pattern = get_traffic_pattern_tag(facility_id, "CAR_IN")
-    
-    event_data = {
+    event = {
         "event_id": str(uuid.uuid4()),
         "event_type": "CAR_IN",
         "session_id": session_id,
-        "license_plate": license_plate,
-        "license_plate_state": license_plate_state,
         "facility_id": facility_id,
         "facility_name": facility["name"],
         "district": facility["district"],
+        "license_plate": license_plate,
+        "license_plate_state": license_plate_state,
         "event_time": event_time,
         "available_after": facility["available"],
         "parking_duration_hours": None,
@@ -757,147 +727,118 @@ def process_car_entry(facility_id):
     }
     
     # Stream to Snowflake
-    snowpipe_streamer.stream_event(event_data)
-    snowpipe_streamer.stream_session({
-        "session_id": session_id,
-        "license_plate": license_plate,
-        "license_plate_state": license_plate_state,
-        "facility_id": facility_id,
-        "facility_name": facility["name"],
-        "district": facility["district"],
-        "in_time": event_time,
-        "out_time": None,
-        "actual_duration_hours": None,
-        "rate_per_hour": facility["rate"],
-        "cost": None,
-        "status": "active",
-    })
+    snowpipe_streamer = get_snowpipe_streamer()
+    snowpipe_streamer.stream_event(event)
     
     st.session_state.total_car_in += 1
-    return event_data
+    
+    return event
 
 def process_car_exit(session_id):
-    """Process a car exit based on probability check."""
-    session = st.session_state.active_sessions.get(session_id)
-    if not session:
+    """Process a car exit event."""
+    if session_id not in st.session_state.active_sessions:
         return None
     
-    event_time = datetime.now()
-    in_time = session["in_time"]
-    actual_duration = (event_time - in_time).total_seconds() / 3600
-    
+    session = st.session_state.active_sessions.pop(session_id)
     facility_id = session["facility_id"]
-    facility = st.session_state.facilities.get(facility_id)
+    facility = st.session_state.facilities[facility_id]
     
-    # Calculate cost
-    rate = session["rate"]
-    billable_hours = max(1, math.ceil(actual_duration))
-    cost = billable_hours * rate if rate > 0 else 0
+    event_time = datetime.now()
+    parked_duration = (event_time - session["in_time"]).total_seconds() / 3600
+    
+    # Calculate cost (minimum 1 hour billing)
+    billable_hours = max(1, math.ceil(parked_duration))
+    cost = billable_hours * session["rate"]
     
     # Update facility state
-    if facility:
-        facility["available"] += 1
-    
-    # Remove from active sessions
-    del st.session_state.active_sessions[session_id]
+    facility["available"] = min(facility["total_spots"], facility["available"] + 1)
     
     # Create event
     traffic_pattern = get_traffic_pattern_tag(facility_id, "CAR_OUT")
-    
-    event_data = {
+    event = {
         "event_id": str(uuid.uuid4()),
         "event_type": "CAR_OUT",
         "session_id": session_id,
+        "facility_id": facility_id,
+        "facility_name": facility["name"],
+        "district": facility["district"],
         "license_plate": session["license_plate"],
         "license_plate_state": session.get("license_plate_state", "NY"),
-        "facility_id": facility_id,
-        "facility_name": session["facility_name"],
-        "district": session["district"],
         "event_time": event_time,
-        "available_after": facility["available"] if facility else 0,
-        "parking_duration_hours": actual_duration,
-        "cost": cost,
+        "available_after": facility["available"],
+        "parking_duration_hours": round(parked_duration, 2),
+        "cost": round(cost, 2),
         "traffic_pattern": traffic_pattern,
     }
     
-    # Stream to Snowflake
-    snowpipe_streamer.stream_event(event_data)
-    snowpipe_streamer.stream_session({
+    # Create completed session data
+    completed_session = {
         "session_id": session_id,
         "license_plate": session["license_plate"],
         "license_plate_state": session.get("license_plate_state", "NY"),
         "facility_id": facility_id,
-        "facility_name": session["facility_name"],
-        "district": session["district"],
-        "in_time": in_time,
+        "facility_name": facility["name"],
+        "district": facility["district"],
+        "in_time": session["in_time"],
         "out_time": event_time,
-        "actual_duration_hours": actual_duration,
-        "rate_per_hour": rate,
-        "cost": cost,
+        "actual_duration_hours": round(parked_duration, 2),
+        "rate_per_hour": session["rate"],
+        "cost": round(cost, 2),
         "status": "completed",
-    })
+    }
+    
+    # Stream to Snowflake
+    snowpipe_streamer = get_snowpipe_streamer()
+    snowpipe_streamer.stream_event(event)
+    snowpipe_streamer.stream_session(completed_session)
     
     st.session_state.total_car_out += 1
-    return event_data
+    
+    return event
 
 def process_potential_exits():
-    """
-    Check all active sessions and probabilistically exit cars.
-    Cars must be parked at least 15 minutes before they can exit.
-    """
-    events = []
+    """Check all active sessions and process exits based on probability."""
+    exit_events = []
     current_time = datetime.now()
     current_hour = current_time.hour
-    min_park_time = timedelta(minutes=15)
     
-    # Get list of session IDs (can't modify dict while iterating)
-    session_ids = list(st.session_state.active_sessions.keys())
+    sessions_to_check = list(st.session_state.active_sessions.items())
     
-    for session_id in session_ids:
-        session = st.session_state.active_sessions.get(session_id)
-        if not session:
-            continue
+    for session_id, session in sessions_to_check:
+        parked_hours = (current_time - session["in_time"]).total_seconds() / 3600
+        exit_prob = get_exit_probability(parked_hours, session["district"], current_hour)
         
-        in_time = session["in_time"]
-        parked_duration = current_time - in_time
-        
-        # Must be parked at least 15 minutes
-        if parked_duration < min_park_time:
-            continue
-        
-        parked_hours = parked_duration.total_seconds() / 3600
-        district = session["district"]
-        
-        # Get exit probability based on duration, district, and time
-        exit_prob = get_exit_probability(parked_hours, district, current_hour)
-        
-        # Random check - will this car exit now?
         if random.random() < exit_prob:
             event = process_car_exit(session_id)
             if event:
-                events.append(event)
+                exit_events.append(event)
     
-    return events
+    return exit_events
 
 def generate_facility_events(facility_id):
-    """Generate events for a single facility."""
+    """Generate events for a specific facility."""
+    facility = st.session_state.facilities[facility_id]
+    district = facility["district"]
     events = []
-    facility = st.session_state.facilities.get(facility_id)
-    if not facility:
-        return events
     
+    # Determine how many entries based on traffic
     traffic_mult = get_traffic_multiplier(facility_id)
-    entry_bias = get_entry_bias(facility_id)
+    current_hour = datetime.now().hour
     
-    # Calculate how many cars might enter
-    rand = random.random()
-    if rand < 0.15 * (1 - traffic_mult):
-        base_entry_count = 0
-    elif rand < 0.35:
-        base_entry_count = random.randint(1, 2)
-    elif rand < 0.60:
-        base_entry_count = random.randint(2, 4)
-    elif rand < 0.85:
+    # Dynamic entry rate based on time
+    config = get_facility_config(facility_id)
+    is_peak = current_hour in config.get("peak_hours", [])
+    
+    # Entry rate biased by time of day and traffic
+    if is_peak:
+        entry_bias = 1.5 * traffic_mult
+    else:
+        entry_bias = 0.8 * traffic_mult
+    
+    # Random number of entries
+    if 2 <= current_hour < 6:
+        base_entry_count = random.randint(0, 2)
+    elif 6 <= current_hour < 10 or 16 <= current_hour < 20:
         base_entry_count = random.randint(3, 6)
     else:
         base_entry_count = random.randint(5, 8)
@@ -918,6 +859,156 @@ def generate_facility_events(facility_id):
             events.append(event)
     
     return events
+
+# ============== Historical Data Generator ==============
+
+PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "data", "historical_progress.json")
+
+def save_progress(progress_data):
+    """Save progress to a JSON file."""
+    os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump(progress_data, f)
+
+def load_progress():
+    """Load progress from JSON file."""
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return None
+    return None
+
+def clear_progress():
+    """Clear progress file."""
+    if os.path.exists(PROGRESS_FILE):
+        os.remove(PROGRESS_FILE)
+
+def run_historical_generator(start_date, end_date, batch_size):
+    """Run the historical data generator as a subprocess."""
+    script_path = os.path.join(os.path.dirname(__file__), "generate_historical_data.py")
+    
+    # Initialize progress
+    save_progress({
+        "status": "starting",
+        "start_date": start_date,
+        "end_date": end_date,
+        "current_date": start_date,
+        "days_completed": 0,
+        "total_days": 0,
+        "total_events": 0,
+        "total_sessions": 0,
+        "last_update": datetime.now().isoformat(),
+        "output_lines": [],
+        "error": None
+    })
+    
+    cmd = [
+        "python", "-u", script_path,
+        "--start-date", start_date,
+        "--end-date", end_date,
+        "--batch-size", str(batch_size)
+    ]
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=os.path.dirname(__file__)
+        )
+        
+        output_lines = []
+        total_days = 0
+        days_completed = 0
+        total_events = 0
+        total_sessions = 0
+        current_date = start_date
+        
+        for line in iter(process.stdout.readline, ''):
+            line = line.strip()
+            if not line:
+                continue
+                
+            output_lines.append(line)
+            if len(output_lines) > 50:
+                output_lines = output_lines[-50:]
+            
+            # Parse progress from output
+            if "Total Days:" in line:
+                try:
+                    total_days = int(line.split("Total Days:")[1].strip())
+                except:
+                    pass
+            
+            # Parse day progress lines like: "2025-04-19 (Sat): Events=3,117, Pending=567, Total Events=3,117, Sessions=1,275"
+            if "):  Events=" in line or "): Events=" in line:
+                try:
+                    # Extract date
+                    date_part = line.split(" (")[0].strip()
+                    current_date = date_part
+                    days_completed += 1
+                    
+                    # Extract total events and sessions
+                    if "Total Events=" in line:
+                        events_part = line.split("Total Events=")[1].split(",")[0].replace(",", "")
+                        total_events = int(events_part)
+                    if "Sessions=" in line:
+                        sessions_part = line.split("Sessions=")[1].split(",")[0].split()[0].replace(",", "")
+                        total_sessions = int(sessions_part)
+                except Exception as e:
+                    pass
+            
+            # Update progress file
+            save_progress({
+                "status": "running",
+                "start_date": start_date,
+                "end_date": end_date,
+                "current_date": current_date,
+                "days_completed": days_completed,
+                "total_days": total_days,
+                "total_events": total_events,
+                "total_sessions": total_sessions,
+                "last_update": datetime.now().isoformat(),
+                "output_lines": output_lines,
+                "error": None
+            })
+        
+        process.wait()
+        
+        # Final update
+        final_status = "completed" if process.returncode == 0 else "failed"
+        save_progress({
+            "status": final_status,
+            "start_date": start_date,
+            "end_date": end_date,
+            "current_date": end_date if final_status == "completed" else current_date,
+            "days_completed": days_completed,
+            "total_days": total_days,
+            "total_events": total_events,
+            "total_sessions": total_sessions,
+            "last_update": datetime.now().isoformat(),
+            "output_lines": output_lines,
+            "error": None if process.returncode == 0 else f"Process exited with code {process.returncode}"
+        })
+        
+    except Exception as e:
+        save_progress({
+            "status": "failed",
+            "start_date": start_date,
+            "end_date": end_date,
+            "current_date": current_date,
+            "days_completed": 0,
+            "total_days": 0,
+            "total_events": 0,
+            "total_sessions": 0,
+            "last_update": datetime.now().isoformat(),
+            "output_lines": [],
+            "error": str(e)
+        })
 
 # ============== Streamlit UI ==============
 
@@ -944,6 +1035,8 @@ if 'last_count_time' not in st.session_state:
     st.session_state.last_count_time = time.time()
 if 'facility_timers' not in st.session_state:
     st.session_state.facility_timers = {fid: time.time() + random.uniform(0, 10) for fid in range(1, 51)}
+if 'historical_thread' not in st.session_state:
+    st.session_state.historical_thread = None
 
 # Get singleton Snowpipe streamer (cached across reruns)
 snowpipe_streamer = get_snowpipe_streamer()
@@ -966,172 +1059,339 @@ else:
 
 st.caption(f"Snowflake: {sf_status} | Architecture: In-Memory → Snowflake Streaming | Exit Logic: Probability-based (min 15 min)")
 
-# Control panel
-col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns([1, 1, 1, 2])
+# Main Tabs - Add Historical Generator
+main_tab1, main_tab2 = st.tabs(["🎮 Real-Time Simulator", "📅 Historical Data Generator"])
 
-with col_ctrl1:
-    if st.button("▶️ Start" if not st.session_state.generator_running else "⏹️ Stop", 
-                 type="primary", use_container_width=True):
-        st.session_state.generator_running = not st.session_state.generator_running
-        if st.session_state.generator_running:
-            for fid in range(1, 51):
-                st.session_state.facility_timers[fid] = time.time() + random.uniform(0, 5)
-        st.rerun()
+with main_tab1:
+    # Control panel
+    col_ctrl1, col_ctrl2, col_ctrl3, col_ctrl4 = st.columns([1, 1, 1, 2])
+    
+    with col_ctrl1:
+        if st.button("▶️ Start" if not st.session_state.generator_running else "⏹️ Stop", 
+                     type="primary", use_container_width=True, key="realtime_start"):
+            st.session_state.generator_running = not st.session_state.generator_running
+            if st.session_state.generator_running:
+                for fid in range(1, 51):
+                    st.session_state.facility_timers[fid] = time.time() + random.uniform(0, 5)
+            st.rerun()
+    
+    with col_ctrl2:
+        if st.button("🎲 Burst Events", use_container_width=True, key="burst"):
+            num_facilities = random.randint(10, 20)
+            selected = random.sample(range(1, 51), num_facilities)
+            for fid in selected:
+                events = generate_facility_events(fid)
+                st.session_state.recent_events = events + st.session_state.recent_events
+            # Also process some exits
+            exit_events = process_potential_exits()
+            st.session_state.recent_events = exit_events + st.session_state.recent_events
+            st.session_state.recent_events = st.session_state.recent_events[:100]
+            snowpipe_streamer.flush()
+            st.rerun()
+    
+    with col_ctrl3:
+        if st.button("🔄 Restart", use_container_width=True, help="Clear all state and start fresh", key="restart"):
+            st.session_state.generator_running = False
+            reset_state()
+            populate_parking_facilities()
+            st.success("System restarted!")
+            st.rerun()
+    
+    with col_ctrl4:
+        status_color = "🟢" if st.session_state.generator_running else "🔴"
+        total_events = st.session_state.total_car_in + st.session_state.total_car_out
+        active_cars = len(st.session_state.active_sessions)
+        st.markdown(f"**{status_color} {'RUNNING' if st.session_state.generator_running else 'STOPPED'}** | ~{st.session_state.events_per_second:.1f}/sec | Active: {active_cars:,} | Total: {total_events:,}")
+    
+    # Metrics
+    st.markdown("---")
+    
+    total_spots = sum(f["total_spots"] for f in st.session_state.facilities.values())
+    total_available = sum(f["available"] for f in st.session_state.facilities.values())
+    total_occupied = total_spots - total_available
+    
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric("🏢 Facilities", "50")
+    with m2:
+        st.metric("🅿️ Total Spots", f"{total_spots:,}")
+    with m3:
+        st.metric("✅ Available", f"{total_available:,}")
+    with m4:
+        st.metric("🚗 Occupied", f"{total_occupied:,}")
+    with m5:
+        st.metric("🚗 Total In", f"{st.session_state.total_car_in:,}")
+    with m6:
+        st.metric("🚶 Total Out", f"{st.session_state.total_car_out:,}")
+    
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🏢 Facilities", "📜 Event Stream", "🚗 Active Sessions"])
+    
+    with tab1:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("District Occupancy")
+            district_data = []
+            for district_name, facility_ids in DISTRICTS.items():
+                total = sum(st.session_state.facilities[fid]["total_spots"] for fid in facility_ids)
+                available = sum(st.session_state.facilities[fid]["available"] for fid in facility_ids)
+                occupied = total - available
+                pattern = DISTRICT_PATTERNS.get(district_name, {})
+                day_mult = pattern.get("weekend_mult" if is_weekend() else "weekday_mult", 1.0)
+                district_data.append({
+                    "District": district_name,
+                    "Total": total,
+                    "Occupied": occupied,
+                    "Available": available,
+                    "Occupancy": f"{(occupied/total)*100:.1f}%" if total > 0 else "0%",
+                    "Day Pattern": f"{day_mult:.1f}x {'(Weekend)' if is_weekend() else '(Weekday)'}",
+                })
+            
+            df = pd.DataFrame(district_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        with col2:
+            st.subheader("Traffic Pattern Info")
+            current_hour = datetime.now().hour
+            st.info(f"**Current Hour:** {current_hour}:00 | **Day:** {'Weekend' if is_weekend() else 'Weekday'}")
+            
+            st.markdown("**District Activity Levels:**")
+            for district_name, pattern in DISTRICT_PATTERNS.items():
+                day_mult = pattern.get("weekend_mult" if is_weekend() else "weekday_mult", 1.0)
+                is_entry_peak = current_hour in pattern.get("peak_entry_hours", [])
+                is_exit_peak = current_hour in pattern.get("peak_exit_hours", [])
+                
+                status = "🟢" if day_mult > 1.0 else ("🔴" if day_mult < 0.5 else "🟡")
+                entry_icon = "⬆️" if is_entry_peak else ""
+                exit_icon = "⬇️" if is_exit_peak else ""
+                
+                st.markdown(f"{status} **{district_name}**: {day_mult:.1f}x {entry_icon}{exit_icon}")
+    
+    with tab2:
+        st.subheader("All Facilities")
+        for district_name, facility_ids in DISTRICTS.items():
+            st.markdown(f"### {district_name}")
+            cols = st.columns(5)
+            for idx, fid in enumerate(facility_ids):
+                fac = st.session_state.facilities[fid]
+                with cols[idx % 5]:
+                    occupied = fac["total_spots"] - fac["available"]
+                    occ_pct = (occupied / fac["total_spots"]) * 100 if fac["total_spots"] > 0 else 0
+                    status = "🔴" if occ_pct >= 90 else ("🟡" if occ_pct >= 70 else "🟢")
+                    st.markdown(f"**{status} {fac['name'][:18]}**")
+                    st.caption(f"{fac['available']}/{fac['total_spots']} | ${fac['rate']:.0f}/hr")
+                    st.progress(occ_pct / 100)
+    
+    with tab3:
+        st.subheader("Live Event Stream")
+        
+        if st.session_state.recent_events:
+            events_data = []
+            for e in st.session_state.recent_events[:100]:
+                events_data.append({
+                    'Type': "🚗 IN" if e.get('event_type') == 'CAR_IN' else "🚶 OUT",
+                    'Plate': e.get('license_plate', ''),
+                    'Facility': e.get('facility_name', ''),
+                    'District': e.get('district', ''),
+                    'Time': e.get('event_time').strftime('%H:%M:%S') if e.get('event_time') else '',
+                    'Pattern': e.get('traffic_pattern', ''),
+                    'Duration': f"{e.get('parking_duration_hours', 0):.2f}h" if e.get('parking_duration_hours') else "-",
+                    'Cost': f"${e.get('cost', 0):.0f}" if e.get('cost') and e.get('cost') > 0 else ("-" if not e.get('cost') else "FREE"),
+                })
+            events_df = pd.DataFrame(events_data)
+            st.dataframe(events_df, use_container_width=True, hide_index=True, height=500)
+        else:
+            st.info("No events yet. Click Start to begin generating events!")
+    
+    with tab4:
+        st.subheader("Active Parking Sessions")
+        st.caption("💡 Cars exit based on probability (increases with duration). Min parking: 15 minutes.")
+        
+        if st.session_state.active_sessions:
+            sessions_data = []
+            current_time = datetime.now()
+            for session_id, session in list(st.session_state.active_sessions.items())[:100]:
+                parked_hours = (current_time - session["in_time"]).total_seconds() / 3600
+                exit_prob = get_exit_probability(parked_hours, session["district"], current_time.hour)
+                sessions_data.append({
+                    'Plate': session['license_plate'],
+                    'Facility': session['facility_name'],
+                    'District': session['district'],
+                    'In Time': session['in_time'].strftime('%H:%M:%S'),
+                    'Parked': f"{parked_hours:.2f}h",
+                    'Exit Prob': f"{exit_prob*100:.1f}%",
+                    'Rate': f"${session['rate']:.0f}/hr" if session['rate'] > 0 else "FREE",
+                })
+            sessions_df = pd.DataFrame(sessions_data)
+            st.dataframe(sessions_df, use_container_width=True, hide_index=True, height=500)
+        else:
+            st.info("No active sessions. Start the generator to park some cars!")
 
-with col_ctrl2:
-    if st.button("🎲 Burst Events", use_container_width=True):
-        num_facilities = random.randint(10, 20)
-        selected = random.sample(range(1, 51), num_facilities)
-        for fid in selected:
-            events = generate_facility_events(fid)
-            st.session_state.recent_events = events + st.session_state.recent_events
-        # Also process some exits
-        exit_events = process_potential_exits()
-        st.session_state.recent_events = exit_events + st.session_state.recent_events
-        st.session_state.recent_events = st.session_state.recent_events[:100]
-        snowpipe_streamer.flush()
-        st.rerun()
-
-with col_ctrl3:
-    if st.button("🔄 Restart", use_container_width=True, help="Clear all state and start fresh"):
-        st.session_state.generator_running = False
-        reset_state()
-        populate_parking_facilities()
-        st.success("System restarted!")
-        st.rerun()
-
-with col_ctrl4:
-    status_color = "🟢" if st.session_state.generator_running else "🔴"
-    total_events = st.session_state.total_car_in + st.session_state.total_car_out
-    active_cars = len(st.session_state.active_sessions)
-    st.markdown(f"**{status_color} {'RUNNING' if st.session_state.generator_running else 'STOPPED'}** | ~{st.session_state.events_per_second:.1f}/sec | Active: {active_cars:,} | Total: {total_events:,}")
-
-# Metrics
-st.markdown("---")
-
-total_spots = sum(f["total_spots"] for f in st.session_state.facilities.values())
-total_available = sum(f["available"] for f in st.session_state.facilities.values())
-total_occupied = total_spots - total_available
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-with m1:
-    st.metric("🏢 Facilities", "50")
-with m2:
-    st.metric("🅿️ Total Spots", f"{total_spots:,}")
-with m3:
-    st.metric("✅ Available", f"{total_available:,}")
-with m4:
-    st.metric("🚗 Occupied", f"{total_occupied:,}")
-with m5:
-    st.metric("🚗 Total In", f"{st.session_state.total_car_in:,}")
-with m6:
-    st.metric("🚶 Total Out", f"{st.session_state.total_car_out:,}")
-
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🏢 Facilities", "📜 Event Stream", "🚗 Active Sessions"])
-
-with tab1:
-    col1, col2 = st.columns(2)
+with main_tab2:
+    st.subheader("📅 Historical Data Generator")
+    st.markdown("""
+    Generate synthetic historical parking data for a specified date range. 
+    The data will be inserted directly into Snowflake Iceberg tables.
+    """)
+    
+    st.markdown("---")
+    
+    # Configuration Section
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.subheader("District Occupancy")
-        district_data = []
-        for district_name, facility_ids in DISTRICTS.items():
-            total = sum(st.session_state.facilities[fid]["total_spots"] for fid in facility_ids)
-            available = sum(st.session_state.facilities[fid]["available"] for fid in facility_ids)
-            occupied = total - available
-            pattern = DISTRICT_PATTERNS.get(district_name, {})
-            day_mult = pattern.get("weekend_mult" if is_weekend() else "weekday_mult", 1.0)
-            district_data.append({
-                "District": district_name,
-                "Total": total,
-                "Occupied": occupied,
-                "Available": available,
-                "Occupancy": f"{(occupied/total)*100:.1f}%" if total > 0 else "0%",
-                "Day Pattern": f"{day_mult:.1f}x {'(Weekend)' if is_weekend() else '(Weekday)'}",
-            })
-        
-        df = pd.DataFrame(district_data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        default_start = datetime(2025, 1, 1).date()
+        start_date = st.date_input(
+            "Start Date",
+            value=default_start,
+            min_value=datetime(2020, 1, 1).date(),
+            max_value=datetime.now().date() - timedelta(days=1),
+            key="hist_start_date"
+        )
     
     with col2:
-        st.subheader("Traffic Pattern Info")
-        current_hour = datetime.now().hour
-        st.info(f"**Current Hour:** {current_hour}:00 | **Day:** {'Weekend' if is_weekend() else 'Weekday'}")
+        default_end = (datetime.now() - timedelta(days=1)).date()
+        end_date = st.date_input(
+            "End Date",
+            value=default_end,
+            min_value=datetime(2020, 1, 1).date(),
+            max_value=datetime.now().date() - timedelta(days=1),
+            key="hist_end_date"
+        )
+    
+    with col3:
+        batch_size = st.number_input(
+            "Batch Size",
+            value=1000,
+            min_value=100,
+            max_value=10000,
+            step=100,
+            help="Number of records per batch insert",
+            key="hist_batch_size"
+        )
+    
+    # Calculate and show stats
+    if start_date and end_date:
+        total_days = (end_date - start_date).days + 1
+        if total_days > 0:
+            st.info(f"📊 **{total_days} days** selected | Estimated: ~{total_days * 2860:,} events, ~{total_days * 1415:,} sessions")
+        else:
+            st.error("End date must be after start date!")
+    
+    st.markdown("---")
+    
+    # Control buttons
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+    
+    with btn_col1:
+        start_clicked = st.button(
+            "🚀 Start Generation",
+            type="primary",
+            use_container_width=True,
+            disabled=(start_date >= end_date) if start_date and end_date else True,
+            key="hist_start"
+        )
+    
+    with btn_col2:
+        clear_clicked = st.button(
+            "🗑️ Clear Progress",
+            use_container_width=True,
+            key="hist_clear"
+        )
+    
+    # Handle button clicks
+    if clear_clicked:
+        clear_progress()
+        st.success("Progress cleared!")
+        st.rerun()
+    
+    if start_clicked:
+        # Start the generator in a background thread
+        thread = threading.Thread(
+            target=run_historical_generator,
+            args=(str(start_date), str(end_date), batch_size),
+            daemon=True
+        )
+        thread.start()
+        st.session_state.historical_thread = thread
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Progress Section
+    st.subheader("📈 Progress")
+    
+    progress = load_progress()
+    
+    if progress:
+        status = progress.get("status", "unknown")
         
-        st.markdown("**District Activity Levels:**")
-        for district_name, pattern in DISTRICT_PATTERNS.items():
-            day_mult = pattern.get("weekend_mult" if is_weekend() else "weekday_mult", 1.0)
-            is_entry_peak = current_hour in pattern.get("peak_entry_hours", [])
-            is_exit_peak = current_hour in pattern.get("peak_exit_hours", [])
-            
-            status = "🟢" if day_mult > 1.0 else ("🔴" if day_mult < 0.5 else "🟡")
-            entry_icon = "⬆️" if is_entry_peak else ""
-            exit_icon = "⬇️" if is_exit_peak else ""
-            
-            st.markdown(f"{status} **{district_name}**: {day_mult:.1f}x {entry_icon}{exit_icon}")
-
-with tab2:
-    st.subheader("All Facilities")
-    for district_name, facility_ids in DISTRICTS.items():
-        st.markdown(f"### {district_name}")
-        cols = st.columns(5)
-        for idx, fid in enumerate(facility_ids):
-            fac = st.session_state.facilities[fid]
-            with cols[idx % 5]:
-                occupied = fac["total_spots"] - fac["available"]
-                occ_pct = (occupied / fac["total_spots"]) * 100 if fac["total_spots"] > 0 else 0
-                status = "🔴" if occ_pct >= 90 else ("🟡" if occ_pct >= 70 else "🟢")
-                st.markdown(f"**{status} {fac['name'][:18]}**")
-                st.caption(f"{fac['available']}/{fac['total_spots']} | ${fac['rate']:.0f}/hr")
-                st.progress(occ_pct / 100)
-
-with tab3:
-    st.subheader("Live Event Stream")
-    
-    if st.session_state.recent_events:
-        events_data = []
-        for e in st.session_state.recent_events[:100]:
-            events_data.append({
-                'Type': "🚗 IN" if e.get('event_type') == 'CAR_IN' else "🚶 OUT",
-                'Plate': e.get('license_plate', ''),
-                'Facility': e.get('facility_name', ''),
-                'District': e.get('district', ''),
-                'Time': e.get('event_time').strftime('%H:%M:%S') if e.get('event_time') else '',
-                'Pattern': e.get('traffic_pattern', ''),
-                'Duration': f"{e.get('parking_duration_hours', 0):.2f}h" if e.get('parking_duration_hours') else "-",
-                'Cost': f"${e.get('cost', 0):.0f}" if e.get('cost') and e.get('cost') > 0 else ("-" if not e.get('cost') else "FREE"),
-            })
-        events_df = pd.DataFrame(events_data)
-        st.dataframe(events_df, use_container_width=True, hide_index=True, height=500)
+        # Status indicator
+        if status == "completed":
+            st.success("✅ Generation Complete!")
+        elif status == "failed":
+            st.error(f"❌ Generation Failed: {progress.get('error', 'Unknown error')}")
+        elif status == "running":
+            st.info("🔄 Generation in progress...")
+        elif status == "starting":
+            st.info("⏳ Starting generator...")
+        
+        # Progress metrics
+        days_completed = progress.get("days_completed", 0)
+        total_days = progress.get("total_days", 0)
+        total_events = progress.get("total_events", 0)
+        total_sessions = progress.get("total_sessions", 0)
+        current_date = progress.get("current_date", "")
+        
+        # Progress bar
+        if total_days > 0:
+            progress_pct = days_completed / total_days
+            st.progress(progress_pct, text=f"{days_completed}/{total_days} days ({progress_pct*100:.1f}%)")
+        
+        # Metrics
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("📅 Days Completed", f"{days_completed:,}")
+        with m2:
+            st.metric("📅 Total Days", f"{total_days:,}")
+        with m3:
+            st.metric("📊 Total Events", f"{total_events:,}")
+        with m4:
+            st.metric("🎫 Total Sessions", f"{total_sessions:,}")
+        
+        # Current date being processed
+        if current_date and status == "running":
+            st.markdown(f"**Currently processing:** `{current_date}`")
+        
+        # Output log
+        with st.expander("📜 Output Log", expanded=(status == "running")):
+            output_lines = progress.get("output_lines", [])
+            if output_lines:
+                # Show last 30 lines
+                log_text = "\n".join(output_lines[-30:])
+                st.code(log_text, language="text")
+            else:
+                st.text("No output yet...")
+        
+        # Auto-refresh while running
+        if status in ["running", "starting"]:
+            time.sleep(2)
+            st.rerun()
     else:
-        st.info("No events yet. Click Start to begin generating events!")
+        st.info("No generation in progress. Configure the date range above and click 'Start Generation'.")
+        
+        # Show tips
+        with st.expander("💡 Tips"):
+            st.markdown("""
+            - **Start Date**: Choose when you want historical data to begin
+            - **End Date**: Usually yesterday (data up to present)
+            - **Batch Size**: Larger batches are faster but use more memory (default 1000 is recommended)
+            - **Duration**: Generating 1 year of data takes approximately 10-15 minutes
+            - **Data Volume**: ~2,860 events and ~1,415 sessions per day
+            """)
 
-with tab4:
-    st.subheader("Active Parking Sessions")
-    st.caption("💡 Cars exit based on probability (increases with duration). Min parking: 15 minutes.")
-    
-    if st.session_state.active_sessions:
-        sessions_data = []
-        current_time = datetime.now()
-        for session_id, session in list(st.session_state.active_sessions.items())[:100]:
-            parked_hours = (current_time - session["in_time"]).total_seconds() / 3600
-            exit_prob = get_exit_probability(parked_hours, session["district"], current_time.hour)
-            sessions_data.append({
-                'Plate': session['license_plate'],
-                'Facility': session['facility_name'],
-                'District': session['district'],
-                'In Time': session['in_time'].strftime('%H:%M:%S'),
-                'Parked': f"{parked_hours:.2f}h",
-                'Exit Prob': f"{exit_prob*100:.1f}%",
-                'Rate': f"${session['rate']:.0f}/hr" if session['rate'] > 0 else "FREE",
-            })
-        sessions_df = pd.DataFrame(sessions_data)
-        st.dataframe(sessions_df, use_container_width=True, hide_index=True, height=500)
-    else:
-        st.info("No active sessions. Start the generator to park some cars!")
-
-# Event generation loop
+# Event generation loop for real-time simulator
 if st.session_state.generator_running:
     current_time = time.time()
     events_generated = []

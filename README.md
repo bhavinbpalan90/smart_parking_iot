@@ -1,6 +1,6 @@
 # NYC Smart Parking IoT Data Generator
 
-A comprehensive IoT data simulation platform that generates realistic parking facility events across **50 NYC parking facilities** in **6 districts**. The system supports both real-time streaming via Snowpipe and historical batch data generation to Snowflake Iceberg tables.
+A comprehensive IoT data simulation platform that generates realistic parking facility events across **50 NYC parking facilities** in **6 districts**. The unified Streamlit application supports both real-time streaming via Snowpipe and historical batch data generation to Snowflake Iceberg tables.
 
 ## Overview
 
@@ -14,26 +14,29 @@ This project simulates a smart parking system for New York City, generating:
 
 | Feature | Description |
 |---------|-------------|
+| **Unified Streamlit App** | Single application with Real-Time and Historical tabs |
 | **50 Parking Facilities** | Across Manhattan, Brooklyn, Queens, Bronx, Staten Island, and Airports |
 | **Realistic Traffic Patterns** | Borough-specific weekday/weekend multipliers and peak hours |
 | **State License Plates** | NY (60%), NJ (15%), CT (8%), PA (7%), MA (3%), others (7%) |
 | **Snowpipe Streaming** | Real-time sub-second latency ingestion to Iceberg tables |
-| **Historical Backfill** | Batch generation for any date range with consistent patterns |
+| **Historical Backfill** | UI-driven batch generation with live progress tracking |
 | **Iceberg Tables** | Native Snowflake Iceberg format with Delta metadata |
 
 ## Project Structure
 
 ```
 DataGenerator/
-├── app.py                      # Real-time Streamlit dashboard & event generator
+├── app.py                      # Unified Streamlit app (Real-Time + Historical)
 ├── generate_historical_data.py # Historical batch data generator (CLI)
 ├── snowflake_setup.sql         # Snowflake DDL (database, tables, pipes)
 ├── requirements.txt            # Python dependencies
 ├── Dockerfile                  # Container build definition
 ├── docker-compose.yml          # Docker orchestration
+├── .gitignore                  # Git exclusions (keys, .env, data files)
 ├── data/
 │   ├── parking_iot.db          # Local SQLite state (auto-generated)
-│   └── profile.json            # Snowpipe Streaming auth (auto-generated)
+│   ├── profile.json            # Snowpipe Streaming auth (auto-generated)
+│   └── historical_progress.json # Historical generator progress (auto-generated)
 └── keys/
     └── rsa_key.p8              # RSA private key for Snowflake auth
 ```
@@ -44,29 +47,94 @@ DataGenerator/
 
 1. **Snowflake Account** with Iceberg table support
 2. **RSA Key Pair** configured for your Snowflake user
-3. **Python 3.8+** or Docker
+3. **Docker** (recommended) or Python 3.8+
 
 ### Option 1: Docker Compose (Recommended)
 
 ```bash
 cd DataGenerator
-cp .env.example .env  # Edit with your credentials
-docker-compose up --build
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your Snowflake credentials
+
+# Build and run
+docker-compose up --build -d
+
+# View logs
+docker logs -f parking_streamlit
 ```
+
+Access the app at: **http://localhost:8501**
 
 ### Option 2: Local Python
 
 ```bash
 cd DataGenerator
+
+# Install dependencies
 pip install -r requirements.txt
-cp .env.example .env  # Edit with your credentials
 
-# Real-time dashboard
+# Configure environment
+cp .env.example .env
+# Edit .env with your Snowflake credentials
+
+# Run the unified app
 streamlit run app.py --server.port=8501
-
-# Historical data generation
-python generate_historical_data.py --start-date 2025-01-01 --end-date 2025-12-31
 ```
+
+## Application Tabs
+
+The unified Streamlit application has **two main tabs**:
+
+### 🎮 Tab 1: Real-Time Simulator
+
+Live parking event generation with interactive controls.
+
+| Feature | Description |
+|---------|-------------|
+| **Start/Stop** | Toggle continuous event generation |
+| **Burst Events** | Generate random burst across 10-20 facilities |
+| **Restart** | Clear all state and start fresh |
+| **Live Metrics** | Total spots, available, occupied, cars in/out |
+| **District View** | Occupancy gauges per borough |
+| **Facility Grid** | All 50 facilities with real-time status |
+| **Event Stream** | Live CAR_IN/CAR_OUT feed |
+| **Active Sessions** | Current parked cars with exit probability |
+
+### 📅 Tab 2: Historical Data Generator
+
+Batch historical data generation with progress tracking.
+
+| Feature | Description |
+|---------|-------------|
+| **Date Range Picker** | Select start and end dates |
+| **Batch Size** | Configurable (default: 1000 records/batch) |
+| **One-Click Start** | Launch background generation process |
+| **Live Progress Bar** | Visual progress with percentage |
+| **Real-Time Metrics** | Days completed, events, sessions counts |
+| **Output Log** | Expandable log showing generation output |
+| **Auto-Refresh** | UI updates automatically while running |
+
+#### Using the Historical Generator
+
+1. Navigate to the **📅 Historical Data Generator** tab
+2. Select **Start Date** and **End Date**
+3. Adjust **Batch Size** if needed (default 1000)
+4. Click **🚀 Start Generation**
+5. Monitor progress with:
+   - Progress bar showing days completed
+   - Metrics for events and sessions generated
+   - Expandable output log
+6. Generation runs in background - you can switch tabs
+
+#### Data Volume Estimates
+
+| Duration | Events | Sessions | Time |
+|----------|--------|----------|------|
+| 1 month | ~85K | ~42K | ~1-2 min |
+| 6 months | ~500K | ~250K | ~5-7 min |
+| 1 year | ~1M | ~500K | ~10-15 min |
 
 ## Snowflake Setup
 
@@ -178,7 +246,9 @@ Reflects real NYC-area traffic:
 | FL | 2% | `ABC-1234` |
 | Others | 5% | Various |
 
-## Historical Data Generator
+## CLI Historical Generator
+
+For scripting or automation, you can also run the historical generator directly:
 
 ### Usage
 
@@ -192,7 +262,7 @@ Options:
   --dry-run       Simulate without inserting to Snowflake
 ```
 
-### Example: Generate Full Year
+### Example
 
 ```bash
 python -u generate_historical_data.py \
@@ -200,59 +270,6 @@ python -u generate_historical_data.py \
   --end-date 2026-01-31 \
   --batch-size 1000
 ```
-
-### Output
-
-```
-============================================================
-Historical Data Generator for Smart Parking IoT
-============================================================
-Date Range: 2025-04-19 to 2026-01-31
-Total Days: 288
-Batch Size: 1000
-============================================================
-
-Connected to Snowflake: SFPSCOGS-CAPITALONE_AWS_1
-2025-04-19 (Sat): Events=3,117, Pending=567, Total Events=3,117, Sessions=1,275
-2025-04-20 (Sun): Events=3,230, Pending=945, Total Events=6,347, Sessions=2,701
-...
-2026-01-31 (Sat): Events=2,512, Pending=8,553, Total Events=823,605, Sessions=407,526
-
-============================================================
-Generation Complete!
-============================================================
-Total Events Generated: 823,605
-Total Sessions Generated: 407,526
-============================================================
-```
-
-### Data Volume Estimates
-
-| Duration | Events | Sessions | Notes |
-|----------|--------|----------|-------|
-| 1 month | ~85K | ~42K | ~2,800/day |
-| 6 months | ~500K | ~250K | |
-| 1 year | ~1M | ~500K | |
-
-## Real-Time Dashboard (Streamlit)
-
-### Features
-
-- **Live Metrics**: Total spots, available, occupied, cars in/out
-- **District View**: Occupancy gauges per borough
-- **Facility Details**: All 50 facilities with real-time status
-- **Event Stream**: Live CAR_IN/CAR_OUT feed
-- **Session History**: Duration, cost, and status tracking
-
-### Controls
-
-| Button | Action |
-|--------|--------|
-| **Start/Stop** | Toggle continuous event generation |
-| **Burst Events** | Generate random burst across 10-20 facilities |
-| **Reset DB** | Reinitialize local SQLite state |
-
-Access at: http://localhost:8501
 
 ## Configuration
 
@@ -280,6 +297,25 @@ openssl rsa -in rsa_key.pem -pubout -out rsa_key.pub
 
 # Register with Snowflake
 ALTER USER <your_user> SET RSA_PUBLIC_KEY='<public_key_contents>';
+```
+
+## Docker Commands
+
+```bash
+# Build the image
+docker-compose build
+
+# Start the container
+docker-compose up -d
+
+# View logs
+docker logs -f parking_streamlit
+
+# Stop the container
+docker-compose down
+
+# Rebuild and restart
+docker-compose up --build -d
 ```
 
 ## Sample Queries
@@ -356,12 +392,13 @@ ORDER BY occupancy_pct DESC;
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Data Generation                               │
+│                    Unified Streamlit Application                     │
+│                         (app.py)                                     │
 ├─────────────────────────────┬───────────────────────────────────────┤
-│   Real-Time (app.py)        │   Historical (generate_historical)    │
-│   - Streamlit Dashboard     │   - CLI batch generator               │
-│   - Continuous simulation   │   - Date range backfill               │
-│   - Interactive controls    │   - Progress tracking                 │
+│   🎮 Real-Time Simulator    │   📅 Historical Data Generator        │
+│   - Live event generation   │   - Date range selection              │
+│   - Interactive dashboard   │   - Background processing             │
+│   - Snowpipe streaming      │   - Progress tracking                 │
 └──────────────┬──────────────┴──────────────────┬────────────────────┘
                │                                  │
                ▼                                  ▼

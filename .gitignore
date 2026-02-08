@@ -27,6 +27,7 @@ build/
 # Data files (auto-generated)
 data/parking_iot.db
 data/profile.json
+data/historical_progress.json
 
 # IDE
 .idea/
