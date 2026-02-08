@@ -1,0 +1,16 @@
+services:
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: parking_streamlit
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+      # Mount your private key file (create keys/ directory and place rsa_key.p8 there)
+      - ./keys:/app/keys:ro
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1

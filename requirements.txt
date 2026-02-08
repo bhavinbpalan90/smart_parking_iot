@@ -1,0 +1,7 @@
+streamlit>=1.28.0
+pandas>=2.0.0
+plotly>=5.18.0
+python-dotenv>=1.0.0
+snowflake-connector-python[pandas]>=3.6.0
+pyarrow>=14.0.0
+snowpipe-streaming>=0.1.0

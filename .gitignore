@@ -1,0 +1,44 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Keys and secrets
+keys/
+*.p8
+*.pem
+*.key
+rsa_key.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.egg-info/
+dist/
+build/
+*.egg
+
+# Data files (auto-generated)
+data/parking_iot.db
+data/profile.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
